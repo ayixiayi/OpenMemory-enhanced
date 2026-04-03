@@ -750,7 +750,7 @@ const get_sal = async (id: string, def_sal: number): Promise<number> => {
 export async function hsg_query(
     qt: string,
     k = 10,
-    f?: { sectors?: string[]; minSalience?: number; user_id?: string; startTime?: number; endTime?: number },
+    f?: { sectors?: string[]; minSalience?: number; user_id?: string; startTime?: number; endTime?: number; project?: string },
 ): Promise<hsg_q_result[]> {
 
 
@@ -843,6 +843,7 @@ export async function hsg_query(
             const m = await q.get_mem.get(mid);
             if (!m || (f?.minSalience && m.salience < f.minSalience)) continue;
             if (f?.user_id && m.user_id !== f.user_id) continue;
+            if (f?.project && m.project !== f.project) continue;
             if (f?.startTime && m.created_at < f.startTime) continue;
             if (f?.endTime && m.created_at > f.endTime) continue;
             const mvf = await calc_multi_vec_fusion_score(mid, qe, w);
@@ -1041,6 +1042,9 @@ export async function add_hsg_memory(
     tags?: string,
     metadata?: any,
     user_id?: string,
+    project?: string,
+    session_id?: string,
+    observation_type?: string,
 ): Promise<{
     id: string;
     primary_sector: string;
@@ -1115,6 +1119,9 @@ export async function add_hsg_memory(
             null,
             null,
             0,
+            project ?? "default",
+            session_id ?? null,
+            observation_type ?? "observation",
         );
         const emb_res = await embedMultiSector(
             id,

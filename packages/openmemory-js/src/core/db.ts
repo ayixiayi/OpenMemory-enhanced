@@ -25,10 +25,27 @@ type q_type = {
     all_mem_by_user: {
         all: (user_id: string, limit: number, offset: number) => Promise<any[]>;
     };
+    all_mem_by_project: {
+        all: (project: string, limit: number, offset: number) => Promise<any[]>;
+    };
+    timeline_before: {
+        all: (project: string, created_at: number, limit: number) => Promise<any[]>;
+    };
+    timeline_after: {
+        all: (project: string, created_at: number, limit: number) => Promise<any[]>;
+    };
     get_segment_count: { get: (segment: number) => Promise<any> };
     get_max_segment: { get: () => Promise<any> };
     get_segments: { all: () => Promise<any[]> };
     get_mem_by_segment: { all: (segment: number) => Promise<any[]> };
+
+    ins_session: { run: (...p: any[]) => Promise<void> };
+    get_session: { get: (id: string) => Promise<any> };
+    end_session: { run: (...p: any[]) => Promise<void> };
+    ins_summary: { run: (...p: any[]) => Promise<void> };
+    get_summaries_by_project: {
+        all: (project: string, limit: number) => Promise<any[]>;
+    };
 
     ins_waypoint: { run: (...p: any[]) => Promise<void> };
     get_neighbors: { all: (src: string) => Promise<any[]> };
@@ -94,6 +111,8 @@ if (is_pg) {
     const w = `"${sc}"."openmemory_waypoints"`;
     const l = `"${sc}"."openmemory_embed_logs"`;
     const f = `"${sc}"."openmemory_memories_fts"`;
+    const s = `"${sc}"."openmemory_sessions"`;
+    const sm = `"${sc}"."openmemory_summaries"`;
     const exec = async (sql: string, p: any[] = []) => {
         const c = cli || pg;
         return (await c.query(convertPlaceholders(sql), p)).rows;
@@ -155,7 +174,7 @@ if (is_pg) {
         await pg.query(`create extension if not exists vector`);
         console.error("[DB] pgvector extension enabled");
         await pg.query(
-            `create table if not exists ${m}(id uuid primary key,user_id text,segment integer default 0,content text not null,simhash text,primary_sector text not null,tags text,meta text,created_at bigint,updated_at bigint,last_seen_at bigint,salience double precision,decay_lambda double precision,version integer default 1,mean_dim integer,mean_vec bytea,compressed_vec bytea,feedback_score double precision default 0)`,
+            `create table if not exists ${m}(id uuid primary key,user_id text,segment integer default 0,content text not null,simhash text,primary_sector text not null,tags text,meta text,created_at bigint,updated_at bigint,last_seen_at bigint,salience double precision,decay_lambda double precision,version integer default 1,mean_dim integer,mean_vec bytea,compressed_vec bytea,feedback_score double precision default 0,project text default 'default',session_id text,observation_type text default 'observation')`,
         );
         await pg.query(
             `create table if not exists ${v}(id uuid,sector text,user_id text,v vector,dim integer not null,primary key(id,sector))`,
@@ -184,6 +203,12 @@ if (is_pg) {
         );
         await pg.query(
             `create table if not exists "${sc}"."temporal_edges"(id uuid primary key,source_id uuid not null,target_id uuid not null,relation_type text not null,valid_from bigint not null,valid_to bigint,weight double precision not null,metadata text,foreign key(source_id) references "${sc}"."temporal_facts"(id),foreign key(target_id) references "${sc}"."temporal_facts"(id))`,
+        );
+        await pg.query(
+            `create table if not exists ${s}(id uuid primary key,project text not null default 'default',started_at bigint not null,ended_at bigint,user_goal text,user_id text)`,
+        );
+        await pg.query(
+            `create table if not exists ${sm}(id serial primary key,session_id uuid not null,project text not null default 'default',request text,completed text,learned text,next_steps text,files_modified text,created_at bigint not null,foreign key(session_id) references ${s}(id))`,
         );
         await pg.query(
             `create index if not exists temporal_facts_subject_idx on "${sc}"."temporal_facts"(subject)`,
@@ -219,6 +244,15 @@ if (is_pg) {
             `create index if not exists openmemory_memories_user_idx on ${m}(user_id)`,
         );
         await pg.query(
+            `create index if not exists idx_memories_project on ${m}(project)`,
+        );
+        await pg.query(
+            `create index if not exists idx_memories_session on ${m}(session_id)`,
+        );
+        await pg.query(
+            `create index if not exists idx_memories_obstype on ${m}(observation_type)`,
+        );
+        await pg.query(
             `create index if not exists openmemory_vectors_user_idx on ${v}(user_id)`,
         );
         await pg.query(
@@ -229,6 +263,15 @@ if (is_pg) {
         );
         await pg.query(
             `create index if not exists openmemory_stats_type_idx on "${sc}"."stats"(type)`,
+        );
+        await pg.query(
+            `create index if not exists idx_sessions_project on ${s}(project)`,
+        );
+        await pg.query(
+            `create index if not exists idx_summaries_project on ${sm}(project)`,
+        );
+        await pg.query(
+            `create index if not exists idx_summaries_session on ${sm}(session_id)`,
         );
         await pg.query(
             `create index if not exists openmemory_stats_type_idx on "${sc}"."stats"(type)`,
@@ -264,7 +307,7 @@ if (is_pg) {
         ins_mem: {
             run: (...p) =>
                 run_async(
-                    `insert into ${m}(id,user_id,segment,content,simhash,primary_sector,tags,meta,created_at,updated_at,last_seen_at,salience,decay_lambda,version,mean_dim,mean_vec,compressed_vec,feedback_score) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) on conflict(id) do update set user_id=excluded.user_id,segment=excluded.segment,content=excluded.content,simhash=excluded.simhash,primary_sector=excluded.primary_sector,tags=excluded.tags,meta=excluded.meta,created_at=excluded.created_at,updated_at=excluded.updated_at,last_seen_at=excluded.last_seen_at,salience=excluded.salience,decay_lambda=excluded.decay_lambda,version=excluded.version,mean_dim=excluded.mean_dim,mean_vec=excluded.mean_vec,compressed_vec=excluded.compressed_vec,feedback_score=excluded.feedback_score`,
+                    `insert into ${m}(id,user_id,segment,content,simhash,primary_sector,tags,meta,created_at,updated_at,last_seen_at,salience,decay_lambda,version,mean_dim,mean_vec,compressed_vec,feedback_score,project,session_id,observation_type) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) on conflict(id) do update set user_id=excluded.user_id,segment=excluded.segment,content=excluded.content,simhash=excluded.simhash,primary_sector=excluded.primary_sector,tags=excluded.tags,meta=excluded.meta,created_at=excluded.created_at,updated_at=excluded.updated_at,last_seen_at=excluded.last_seen_at,salience=excluded.salience,decay_lambda=excluded.decay_lambda,version=excluded.version,mean_dim=excluded.mean_dim,mean_vec=excluded.mean_vec,compressed_vec=excluded.compressed_vec,feedback_score=excluded.feedback_score,project=excluded.project,session_id=excluded.session_id,observation_type=excluded.observation_type`,
                     p,
                 ),
         },
@@ -430,6 +473,54 @@ if (is_pg) {
                     [user_id, limit, offset],
                 ),
         },
+        all_mem_by_project: {
+            all: (project, limit, offset) =>
+                all_async(
+                    `select * from ${m} where project=$1 order by created_at desc limit $2 offset $3`,
+                    [project, limit, offset],
+                ),
+        },
+        timeline_before: {
+            all: (project, created_at, limit) =>
+                all_async(
+                    `select * from ${m} where project=$1 and created_at<$2 order by created_at desc limit $3`,
+                    [project, created_at, limit],
+                ),
+        },
+        timeline_after: {
+            all: (project, created_at, limit) =>
+                all_async(
+                    `select * from ${m} where project=$1 and created_at>$2 order by created_at asc limit $3`,
+                    [project, created_at, limit],
+                ),
+        },
+        ins_session: {
+            run: (...p) =>
+                run_async(
+                    `insert into ${s}(id,project,started_at,user_id) values($1,$2,$3,$4) on conflict(id) do update set project=excluded.project,started_at=excluded.started_at,user_id=excluded.user_id`,
+                    p,
+                ),
+        },
+        get_session: {
+            get: (id) => get_async(`select * from ${s} where id=$1`, [id]),
+        },
+        end_session: {
+            run: (...p) => run_async(`update ${s} set ended_at=$1 where id=$2`, p),
+        },
+        ins_summary: {
+            run: (...p) =>
+                run_async(
+                    `insert into ${sm}(session_id,project,request,completed,learned,next_steps,files_modified,created_at) values($1,$2,$3,$4,$5,$6,$7,$8)`,
+                    p,
+                ),
+        },
+        get_summaries_by_project: {
+            all: (project, limit) =>
+                all_async(
+                    `select * from ${sm} where project=$1 order by created_at desc limit $2`,
+                    [project, limit],
+                ),
+        },
         ins_user: {
             run: (...p) =>
                 run_async(
@@ -480,7 +571,7 @@ if (is_pg) {
         db.run("PRAGMA locking_mode=NORMAL");
         db.run("PRAGMA busy_timeout=5000");
         db.run(
-            `create table if not exists memories(id text primary key,user_id text,segment integer default 0,content text not null,simhash text,primary_sector text not null,tags text,meta text,created_at integer,updated_at integer,last_seen_at integer,salience real,decay_lambda real,version integer default 1,mean_dim integer,mean_vec blob,compressed_vec blob,feedback_score real default 0)`,
+            `create table if not exists memories(id text primary key,user_id text,segment integer default 0,content text not null,simhash text,primary_sector text not null,tags text,meta text,created_at integer,updated_at integer,last_seen_at integer,salience real,decay_lambda real,version integer default 1,mean_dim integer,mean_vec blob,compressed_vec blob,feedback_score real default 0,project text default 'default',session_id text,observation_type text default 'observation')`,
         );
         db.run(
             `create table if not exists ${sqlite_vector_table}(id text not null,sector text not null,user_id text,v blob not null,dim integer not null,primary key(id,sector))`,
@@ -507,6 +598,12 @@ if (is_pg) {
             `create table if not exists temporal_edges(id text primary key,source_id text not null,target_id text not null,relation_type text not null,valid_from integer not null,valid_to integer,weight real not null,metadata text,foreign key(source_id) references temporal_facts(id),foreign key(target_id) references temporal_facts(id))`,
         );
         db.run(
+            `create table if not exists sessions(id text primary key,project text not null default 'default',started_at integer not null,ended_at integer,user_goal text,user_id text)`,
+        );
+        db.run(
+            `create table if not exists summaries(id integer primary key autoincrement,session_id text not null,project text not null default 'default',request text,completed text,learned text,next_steps text,files_modified text,created_at integer not null,foreign key(session_id) references sessions(id))`,
+        );
+        db.run(
             "create index if not exists idx_memories_sector on memories(primary_sector)",
         );
         db.run(
@@ -520,6 +617,15 @@ if (is_pg) {
         );
         db.run(
             "create index if not exists idx_memories_user on memories(user_id)",
+        );
+        db.run(
+            "create index if not exists idx_memories_project on memories(project)",
+        );
+        db.run(
+            "create index if not exists idx_memories_session on memories(session_id)",
+        );
+        db.run(
+            "create index if not exists idx_memories_obstype on memories(observation_type)",
         );
         db.run(
             `create index if not exists idx_vectors_user on ${sqlite_vector_table}(user_id)`,
@@ -555,6 +661,15 @@ if (is_pg) {
         );
         db.run(
             "create index if not exists idx_edges_validity on temporal_edges(valid_from,valid_to)",
+        );
+        db.run(
+            "create index if not exists idx_sessions_project on sessions(project)",
+        );
+        db.run(
+            "create index if not exists idx_summaries_project on summaries(project)",
+        );
+        db.run(
+            "create index if not exists idx_summaries_session on summaries(session_id)",
         );
         db.run(
             "create index if not exists idx_edges_validity on temporal_edges(valid_from,valid_to)",
@@ -653,7 +768,7 @@ if (is_pg) {
         ins_mem: {
             run: (...p) =>
                 exec(
-                    "insert into memories(id,user_id,segment,content,simhash,primary_sector,tags,meta,created_at,updated_at,last_seen_at,salience,decay_lambda,version,mean_dim,mean_vec,compressed_vec,feedback_score) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "insert into memories(id,user_id,segment,content,simhash,primary_sector,tags,meta,created_at,updated_at,last_seen_at,salience,decay_lambda,version,mean_dim,mean_vec,compressed_vec,feedback_score,project,session_id,observation_type) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     p,
                 ),
         },
@@ -817,6 +932,54 @@ if (is_pg) {
                 many(
                     "select * from memories where user_id=? order by created_at desc limit ? offset ?",
                     [user_id, limit, offset],
+                ),
+        },
+        all_mem_by_project: {
+            all: (project, limit, offset) =>
+                many(
+                    "select * from memories where project=? order by created_at desc limit ? offset ?",
+                    [project, limit, offset],
+                ),
+        },
+        timeline_before: {
+            all: (project, created_at, limit) =>
+                many(
+                    "select * from memories where project=? and created_at<? order by created_at desc limit ?",
+                    [project, created_at, limit],
+                ),
+        },
+        timeline_after: {
+            all: (project, created_at, limit) =>
+                many(
+                    "select * from memories where project=? and created_at>? order by created_at asc limit ?",
+                    [project, created_at, limit],
+                ),
+        },
+        ins_session: {
+            run: (...p) =>
+                exec(
+                    "insert or replace into sessions(id,project,started_at,user_id) values(?,?,?,?)",
+                    p,
+                ),
+        },
+        get_session: {
+            get: (id) => one("select * from sessions where id=?", [id]),
+        },
+        end_session: {
+            run: (...p) => exec("update sessions set ended_at=? where id=?", p),
+        },
+        ins_summary: {
+            run: (...p) =>
+                exec(
+                    "insert into summaries(session_id,project,request,completed,learned,next_steps,files_modified,created_at) values(?,?,?,?,?,?,?,?)",
+                    p,
+                ),
+        },
+        get_summaries_by_project: {
+            all: (project, limit) =>
+                many(
+                    "select * from summaries where project=? order by created_at desc limit ?",
+                    [project, limit],
                 ),
         },
         ins_user: {

@@ -153,6 +153,12 @@ export const create_mcp_srv = () => {
                 .min(1)
                 .optional()
                 .describe("Isolate results to a specific user identifier"),
+            project: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe("Restrict search to a specific project scope"),
         },
         async ({
             query,
@@ -163,21 +169,24 @@ export const create_mcp_srv = () => {
             sector,
             min_salience,
             user_id,
+            project,
         }) => {
             const u = uid(user_id);
+            const proj = project?.trim() || undefined;
             const results: any = { type, query };
             const at_date = at ? new Date(at) : new Date();
 
 
             if (type === "contextual" || type === "unified") {
                 const flt =
-                    sector || min_salience !== undefined || u
+                    sector || min_salience !== undefined || u || proj
                         ? {
                             ...(sector ? { sectors: [sector as sector_type] } : {}),
                             ...(min_salience !== undefined
                                 ? { minSalience: min_salience }
                                 : {}),
                             ...(u ? { user_id: u } : {}),
+                            ...(proj ? { project: proj } : {}),
                         }
                         : undefined;
 
@@ -329,8 +338,45 @@ export const create_mcp_srv = () => {
                 .describe(
                     "Associate the memory with a specific user identifier",
                 ),
+            project: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe(
+                    "Project scope for this memory (e.g., directory basename)",
+                ),
+            session_id: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe("Session identifier for grouping related memories"),
+            observation_type: z
+                .enum([
+                    "observation",
+                    "bugfix",
+                    "decision",
+                    "discovery",
+                    "feature",
+                    "gotcha",
+                    "refactor",
+                ])
+                .optional()
+                .default("observation")
+                .describe("Type of observation being stored"),
         },
-        async ({ content, type = "contextual", facts, tags, metadata, user_id }) => {
+        async ({
+            content,
+            type = "contextual",
+            facts,
+            tags,
+            metadata,
+            user_id,
+            project,
+            session_id,
+            observation_type,
+        }) => {
             const u = uid(user_id);
             const results: any = { type };
 
@@ -351,6 +397,9 @@ export const create_mcp_srv = () => {
                     j(tags || []),
                     metadata,
                     u,
+                    project,
+                    session_id,
+                    observation_type,
                 );
                 results.hsg = {
                     id: res.id,
@@ -496,19 +545,39 @@ export const create_mcp_srv = () => {
                 .min(1)
                 .optional()
                 .describe("Restrict results to a specific user identifier"),
+            project: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe("Restrict to a specific project"),
         },
-        async ({ limit, sector, user_id }) => {
+        async ({ limit, sector, user_id, project }) => {
             const u = uid(user_id);
+            const proj = project?.trim() || undefined;
             let rows: mem_row[];
             if (u) {
                 const all = await q.all_mem_by_user.all(u, limit ?? 10, 0);
-                rows = sector
-                    ? all.filter((row) => row.primary_sector === sector)
-                    : all;
+                rows = all.filter(
+                    (row) =>
+                        (!sector || row.primary_sector === sector) &&
+                        (!proj || (row as any).project === proj),
+                );
             } else {
-                rows = sector
-                    ? await q.all_mem_by_sector.all(sector, limit ?? 10, 0)
-                    : await q.all_mem.all(limit ?? 10, 0);
+                if (proj) {
+                    const scoped = await q.all_mem_by_project.all(
+                        proj,
+                        limit ?? 10,
+                        0,
+                    );
+                    rows = sector
+                        ? scoped.filter((row) => row.primary_sector === sector)
+                        : scoped;
+                } else {
+                    rows = sector
+                        ? await q.all_mem_by_sector.all(sector, limit ?? 10, 0)
+                        : await q.all_mem.all(limit ?? 10, 0);
+                }
             }
             const items = rows.map((row) => ({
                 ...build_mem_snap(row),
@@ -526,6 +595,115 @@ export const create_mcp_srv = () => {
                         text: lns.join("\n\n") || "No memories stored yet.",
                     },
                     { type: "text", text: JSON.stringify({ items }, null, 2) },
+                ],
+            };
+        },
+    );
+
+    registry.tool(
+        "openmemory_summarize",
+        "Persist a summary of work completed in a session.",
+        {
+            session_id: z.string().min(1).describe("Session identifier"),
+            project: z
+                .string()
+                .min(1)
+                .describe("Project name (working directory basename)"),
+            request: z.string().min(1).describe("What the user originally asked for"),
+            completed: z.string().min(1).describe("What was actually completed"),
+            learned: z.string().min(1).describe("Key learnings and discoveries"),
+            next_steps: z.string().optional().describe("Remaining work or follow-ups"),
+            files_modified: z
+                .array(z.string())
+                .optional()
+                .describe("List of modified file paths"),
+        },
+        async (args) => {
+            const existing = await q.get_session.get(args.session_id);
+            if (!existing) {
+                await q.ins_session.run(
+                    args.session_id,
+                    args.project,
+                    Date.now(),
+                    null,
+                );
+            }
+            await q.ins_summary.run(
+                args.session_id,
+                args.project,
+                args.request,
+                args.completed,
+                args.learned,
+                args.next_steps || null,
+                args.files_modified ? JSON.stringify(args.files_modified) : null,
+                Date.now(),
+            );
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Session summary saved for project "${args.project}"`,
+                    },
+                ],
+            };
+        },
+    );
+
+    registry.tool(
+        "openmemory_timeline",
+        "Get surrounding observations around an anchor memory for chronological context.",
+        {
+            memory_id: z.string().min(1).describe("Anchor memory ID"),
+            depth_before: z
+                .number()
+                .int()
+                .min(0)
+                .max(50)
+                .default(5)
+                .describe("Number of memories before the anchor"),
+            depth_after: z
+                .number()
+                .int()
+                .min(0)
+                .max(50)
+                .default(5)
+                .describe("Number of memories after the anchor"),
+        },
+        async (args) => {
+            const anchor = await q.get_mem.get(args.memory_id);
+            if (!anchor) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Memory ${args.memory_id} not found`,
+                        },
+                    ],
+                    isError: true,
+                };
+            }
+
+            const project = (anchor as any).project || "default";
+            const created = Number((anchor as any).created_at || 0);
+
+            const before = await q.timeline_before.all(
+                project,
+                created,
+                args.depth_before,
+            );
+            const after = await q.timeline_after.all(
+                project,
+                created,
+                args.depth_after,
+            );
+
+            const timeline = [...before.reverse(), anchor, ...after];
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({ timeline }, null, 2),
+                    },
                 ],
             };
         },
@@ -617,6 +795,8 @@ export const create_mcp_srv = () => {
                     "openmemory_reinforce",
                     "openmemory_list",
                     "openmemory_get",
+                    "openmemory_summarize",
+                    "openmemory_timeline",
                 ],
             };
             return {
