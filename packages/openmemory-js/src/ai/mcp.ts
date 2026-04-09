@@ -769,6 +769,172 @@ export const create_mcp_srv = () => {
             };
         },
     );
+    // ── openmemory_status (self-teaching: embeds protocol + stats in response) ──
+    registry.tool(
+        "openmemory_status",
+        "Get memory system status, statistics, and usage protocol. Call this on wake-up to learn how to use the memory system.",
+        {},
+        async () => {
+            const total_rows = await all_async(
+                `select count(*) as c from ${memories_table}`,
+            );
+            const total = total_rows?.[0]?.c ?? 0;
+
+            const by_sector = await all_async(
+                `select primary_sector as sector, count(*) as count, round(avg(salience), 3) as avg_salience from ${memories_table} group by primary_sector order by count desc`,
+            );
+
+            const by_project = await all_async(
+                `select project, count(*) as count from ${memories_table} group by project order by count desc limit 20`,
+            );
+
+            const by_type = await all_async(
+                `select observation_type as type, count(*) as count from ${memories_table} group by observation_type order by count desc`,
+            );
+
+            const summary_count = await all_async(
+                `select count(*) as c from summaries`,
+            );
+
+            const session_count = await all_async(
+                `select count(*) as c from sessions`,
+            );
+
+            const protocol = `MEMORY PROTOCOL:
+1. SESSION START: Call openmemory_wakeup(project) to load compressed context (~200 tokens). If no memories exist, proceed normally.
+2. DURING WORK: After completing meaningful tasks, call openmemory_store with:
+   - content: compressed observation (write for a future agent with zero context)
+   - project: working directory basename
+   - observation_type: one of observation|bugfix|decision|discovery|feature|gotcha|refactor
+   - tags: consistent category tags
+   - metadata: { facts: [...], files_involved: [...], concepts: [...] }
+3. BEFORE FACTS CHANGE: If a previously stored fact is now outdated, store the new fact with updated context.
+4. SESSION END: Call openmemory_summarize with session_id, project, request, completed, learned, next_steps, files_modified.
+5. SEARCH: Use openmemory_query(query, project) when user asks about past work. Use natural language.
+6. NEVER GUESS: If the user asks about past work, search first. Don't rely on your own memory.`;
+
+            const pay = {
+                total_memories: total,
+                total_summaries: summary_count?.[0]?.c ?? 0,
+                total_sessions: session_count?.[0]?.c ?? 0,
+                by_sector,
+                by_project,
+                by_observation_type: by_type,
+                embeddings: getEmbeddingInfo(),
+                protocol,
+                available_tools: [
+                    "openmemory_status",
+                    "openmemory_wakeup",
+                    "openmemory_query",
+                    "openmemory_store",
+                    "openmemory_summarize",
+                    "openmemory_timeline",
+                    "openmemory_list",
+                    "openmemory_get",
+                    "openmemory_reinforce",
+                    "openmemory_delete",
+                ],
+            };
+
+            return {
+                content: [{ type: "text", text: JSON.stringify(pay, null, 2) }],
+            };
+        },
+    );
+
+    // ── openmemory_wakeup (4-layer: L0 identity + L1 top-N essential story) ──
+    registry.tool(
+        "openmemory_wakeup",
+        "Load compressed project context for session start. Returns identity + top memories + recent summaries in a single call (~200 tokens). Call this ONCE at the beginning of every session.",
+        {
+            project: z
+                .string()
+                .trim()
+                .min(1)
+                .describe("Project name (working directory basename). Use 'home' for home directory."),
+            limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(50)
+                .default(15)
+                .describe("Max memories to include in essential story (default 15)"),
+        },
+        async (args: { project: string; limit?: number }) => {
+            const limit = args.limit ?? 15;
+            const max_chars = 3200;
+
+            // L0: Identity (static, optional)
+            let identity = "";
+            try {
+                const fs = await import("fs");
+                const path = await import("path");
+                const os = await import("os");
+                const id_path = path.join(os.homedir(), ".openmemory-enhanced", "identity.txt");
+                if (fs.existsSync(id_path)) {
+                    identity = fs.readFileSync(id_path, "utf-8").trim();
+                }
+            } catch { /* no identity file, that's fine */ }
+
+            // L1: Top-N memories by salience, project-scoped
+            const top_memories = await all_async(
+                `select id, content, observation_type, primary_sector, salience, project from ${memories_table} where project=? order by salience desc, created_at desc limit ?`,
+                [args.project, limit],
+            );
+
+            // Group by observation_type, truncate to budget
+            const grouped: Record<string, string[]> = {};
+            let chars = 0;
+            for (const m of top_memories) {
+                if (chars >= max_chars) break;
+                const typ = m.observation_type || "observation";
+                if (!grouped[typ]) grouped[typ] = [];
+                const line = trunc(m.content.replace(/\s+/g, " ").trim(), 200);
+                grouped[typ].push(line);
+                chars += line.length;
+            }
+
+            let essential_story = "";
+            for (const [typ, lines] of Object.entries(grouped)) {
+                essential_story += `[${typ.toUpperCase()}]\n`;
+                for (const line of lines) {
+                    essential_story += `- ${line}\n`;
+                }
+                essential_story += "\n";
+            }
+
+            // L1.5: Recent summaries
+            const recent_summaries = await all_async(
+                `select request, completed, learned, next_steps, created_at from summaries where project=? order by created_at desc limit 3`,
+                [args.project],
+            );
+
+            let summary_text = "";
+            for (const s of recent_summaries) {
+                summary_text += `Session: ${s.request || "?"}\n`;
+                summary_text += `  Done: ${trunc(s.completed || "", 150)}\n`;
+                if (s.learned) summary_text += `  Learned: ${trunc(s.learned, 100)}\n`;
+                if (s.next_steps) summary_text += `  Next: ${trunc(s.next_steps, 100)}\n`;
+                summary_text += "\n";
+            }
+
+            const sections: string[] = [];
+            if (identity) sections.push(`## Identity\n${identity}`);
+            if (essential_story.trim()) sections.push(`## Essential Context (${top_memories.length} memories)\n${essential_story.trim()}`);
+            if (summary_text.trim()) sections.push(`## Recent Sessions (${recent_summaries.length})\n${summary_text.trim()}`);
+
+            if (sections.length === 0) {
+                return {
+                    content: [{ type: "text", text: `No memories found for project "${args.project}". This appears to be a new project.` }],
+                };
+            }
+
+            return {
+                content: [{ type: "text", text: sections.join("\n\n") }],
+            };
+        },
+    );
+
     registry.apply(srv);
 
     srv.resource(
@@ -790,11 +956,14 @@ export const create_mcp_srv = () => {
                 embeddings: getEmbeddingInfo(),
                 server: { version: "2.1.0", protocol: "2025-06-18" },
                 available_tools: [
+                    "openmemory_status",
+                    "openmemory_wakeup",
                     "openmemory_query",
                     "openmemory_store",
                     "openmemory_reinforce",
                     "openmemory_list",
                     "openmemory_get",
+                    "openmemory_delete",
                     "openmemory_summarize",
                     "openmemory_timeline",
                 ],
