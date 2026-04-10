@@ -34,6 +34,11 @@ type q_type = {
     timeline_after: {
         all: (project: string, created_at: number, limit: number) => Promise<any[]>;
     };
+    fts_search: { all: (query: string, limit: number) => Promise<any[]> };
+    count_by_project: { get: (project: string) => Promise<any> };
+    get_oldest_by_project: {
+        all: (project: string, limit: number) => Promise<any[]>;
+    };
     get_segment_count: { get: (segment: number) => Promise<any> };
     get_max_segment: { get: () => Promise<any> };
     get_segments: { all: () => Promise<any[]> };
@@ -494,6 +499,22 @@ if (is_pg) {
                     [project, created_at, limit],
                 ),
         },
+        fts_search: {
+            all: async () => [] as any[],
+        },
+        count_by_project: {
+            get: (project) =>
+                get_async(`select count(*) as c from ${m} where project=$1`, [
+                    project,
+                ]),
+        },
+        get_oldest_by_project: {
+            all: (project, limit) =>
+                all_async(
+                    `select id, content, observation_type, primary_sector, salience, tags, meta, created_at from ${m} where project=$1 order by salience asc, created_at asc limit $2`,
+                    [project, limit],
+                ),
+        },
         ins_session: {
             run: (...p) =>
                 run_async(
@@ -572,6 +593,18 @@ if (is_pg) {
         db.run("PRAGMA busy_timeout=5000");
         db.run(
             `create table if not exists memories(id text primary key,user_id text,segment integer default 0,content text not null,simhash text,primary_sector text not null,tags text,meta text,created_at integer,updated_at integer,last_seen_at integer,salience real,decay_lambda real,version integer default 1,mean_dim integer,mean_vec blob,compressed_vec blob,feedback_score real default 0,project text default 'default',session_id text,observation_type text default 'observation')`,
+        );
+        db.run(
+            `create virtual table if not exists memories_fts using fts5(id,content,content=memories,content_rowid=rowid)`,
+        );
+        db.run(
+            `create trigger if not exists memories_ai after insert on memories begin insert into memories_fts(rowid, id, content) values (new.rowid, new.id, new.content); end;`,
+        );
+        db.run(
+            `create trigger if not exists memories_ad after delete on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); end;`,
+        );
+        db.run(
+            `create trigger if not exists memories_au after update on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); insert into memories_fts(rowid, id, content) values (new.rowid, new.id, new.content); end;`,
         );
         db.run(
             `create table if not exists ${sqlite_vector_table}(id text not null,sector text not null,user_id text,v blob not null,dim integer not null,primary key(id,sector))`,
@@ -953,6 +986,24 @@ if (is_pg) {
                 many(
                     "select * from memories where project=? and created_at>? order by created_at asc limit ?",
                     [project, created_at, limit],
+                ),
+        },
+        fts_search: {
+            all: (query, limit) =>
+                many(
+                    `select id, rank from memories_fts where memories_fts match ? order by rank limit ?`,
+                    [query, limit],
+                ),
+        },
+        count_by_project: {
+            get: (project) =>
+                one("select count(*) as c from memories where project=?", [project]),
+        },
+        get_oldest_by_project: {
+            all: (project, limit) =>
+                many(
+                    "select id, content, observation_type, primary_sector, salience, tags, meta, created_at from memories where project=? order by salience asc, created_at asc limit ?",
+                    [project, limit],
                 ),
         },
         ins_session: {

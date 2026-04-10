@@ -147,6 +147,12 @@ export const create_mcp_srv = () => {
                 .max(1)
                 .optional()
                 .describe("Minimum salience threshold (for HSG queries)"),
+            min_score: z
+                .number()
+                .min(0)
+                .max(1)
+                .optional()
+                .describe("Minimum score threshold to filter low-relevance results"),
             user_id: z
                 .string()
                 .trim()
@@ -168,6 +174,7 @@ export const create_mcp_srv = () => {
             k,
             sector,
             min_salience,
+            min_score,
             user_id,
             project,
         }) => {
@@ -190,7 +197,28 @@ export const create_mcp_srv = () => {
                         }
                         : undefined;
 
-                const matches = await hsg_query(query, k ?? 8, flt);
+                let matches = await hsg_query(query, k ?? 8, flt);
+
+                // BM25 hybrid: boost vector results that also match FTS5
+                if (matches.length > 0) {
+                    try {
+                        const fts_hits = await q.fts_search.all(query, 50);
+                        if (fts_hits.length > 0) {
+                            const fts_ids = new Set(fts_hits.map((h: any) => h.id));
+                            for (const m of matches) {
+                                if (fts_ids.has(m.id)) {
+                                    (m as any).score = Math.min(1.0, m.score * 1.15);
+                                }
+                            }
+                            matches.sort((a: any, b: any) => b.score - a.score);
+                        }
+                    } catch { /* FTS5 not available (Postgres), skip */ }
+                }
+
+                if (min_score !== undefined) {
+                    matches = matches.filter((m: any) => m.score >= min_score);
+                }
+
                 results.contextual = matches.map((m: any) => ({
                     source: "hsg",
                     id: m.id,
@@ -659,14 +687,14 @@ export const create_mcp_srv = () => {
                 .int()
                 .min(0)
                 .max(50)
-                .default(5)
+                .default(3)
                 .describe("Number of memories before the anchor"),
             depth_after: z
                 .number()
                 .int()
                 .min(0)
                 .max(50)
-                .default(5)
+                .default(7)
                 .describe("Number of memories after the anchor"),
         },
         async (args) => {
@@ -771,6 +799,76 @@ export const create_mcp_srv = () => {
     );
     // ── openmemory_status (self-teaching: embeds protocol + stats in response) ──
     registry.tool(
+        "openmemory_consolidate",
+        "Check if a project's memories need consolidation and return the lowest-value candidates for merging. Call this periodically to prevent memory bloat. The agent should review the candidates, synthesize them into fewer high-quality memories via openmemory_store, then delete the originals via openmemory_delete.",
+        {
+            project: z.string().trim().min(1).describe("Project to check for consolidation"),
+            threshold: z
+                .number()
+                .int()
+                .min(10)
+                .max(500)
+                .default(50)
+                .describe("Consolidation triggers when memory count exceeds this (default 50)"),
+            candidate_count: z
+                .number()
+                .int()
+                .min(5)
+                .max(30)
+                .default(10)
+                .describe("Number of lowest-salience candidates to return (default 10)"),
+        },
+        async (args) => {
+            const count_row = await q.count_by_project.get(args.project);
+            const total = count_row?.c ?? 0;
+
+            if (total <= (args.threshold ?? 50)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            needs_consolidation: false,
+                            total_memories: total,
+                            threshold: args.threshold ?? 50,
+                            message: `Project "${args.project}" has ${total} memories (threshold: ${args.threshold ?? 50}). No consolidation needed.`,
+                        }, null, 2),
+                    }],
+                };
+            }
+
+            const candidates = await q.get_oldest_by_project.all(
+                args.project,
+                args.candidate_count ?? 10,
+            );
+
+            const formatted = candidates.map((c: any) => ({
+                id: c.id,
+                content: c.content,
+                observation_type: c.observation_type,
+                primary_sector: c.primary_sector,
+                salience: c.salience,
+                tags: p(c.tags || "[]"),
+                metadata: p(c.meta || "{}"),
+                created_at: c.created_at,
+            }));
+
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        needs_consolidation: true,
+                        total_memories: total,
+                        threshold: args.threshold ?? 50,
+                        excess: total - (args.threshold ?? 50),
+                        candidates: formatted,
+                        instructions: "Review these low-salience memories. Synthesize related ones into fewer, higher-quality memories using openmemory_store, then delete the originals using openmemory_delete. Preserve important facts and decisions; discard redundant or outdated observations.",
+                    }, null, 2),
+                }],
+            };
+        },
+    );
+
+    registry.tool(
         "openmemory_status",
         "Get memory system status, statistics, and usage protocol. Call this on wake-up to learn how to use the memory system.",
         {},
@@ -811,7 +909,8 @@ export const create_mcp_srv = () => {
 3. BEFORE FACTS CHANGE: If a previously stored fact is now outdated, store the new fact with updated context.
 4. SESSION END: Call openmemory_summarize with session_id, project, request, completed, learned, next_steps, files_modified.
 5. SEARCH: Use openmemory_query(query, project) when user asks about past work. Use natural language.
-6. NEVER GUESS: If the user asks about past work, search first. Don't rely on your own memory.`;
+6. NEVER GUESS: If the user asks about past work, search first. Don't rely on your own memory.
+7. CONSOLIDATION: When openmemory_wakeup shows many memories, call openmemory_consolidate(project) to check if consolidation is needed. If yes, synthesize low-value memories into fewer high-quality ones, then delete originals.`;
 
             const pay = {
                 total_memories: total,
@@ -827,6 +926,7 @@ export const create_mcp_srv = () => {
                     "openmemory_wakeup",
                     "openmemory_query",
                     "openmemory_store",
+                    "openmemory_consolidate",
                     "openmemory_summarize",
                     "openmemory_timeline",
                     "openmemory_list",
